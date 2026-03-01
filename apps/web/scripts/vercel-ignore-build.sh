@@ -7,6 +7,33 @@ if [[ "${VERCEL_ENV:-}" != "preview" ]]; then
   exit 1
 fi
 
+if [[ "${FORCE_VERCEL_PREVIEW_BUILD:-}" == "1" ]] || [[ "${FORCE_VERCEL_PREVIEW_BUILD:-}" == "true" ]]; then
+  echo "FORCE_VERCEL_PREVIEW_BUILD is enabled; continue build."
+  exit 1
+fi
+
+current_ref="${VERCEL_GIT_COMMIT_REF:-}"
+preview_ref_prefix="${VERCEL_PREVIEW_BUILD_REF_PREFIX:-preview/}"
+
+if [[ -z "${preview_ref_prefix}" ]]; then
+  preview_ref_prefix="preview/"
+fi
+
+if [[ -n "${current_ref}" ]] && [[ "${current_ref}" == "${preview_ref_prefix}"* ]]; then
+  echo "Branch ${current_ref} matches preview ref allowlist; continue build."
+  exit 1
+fi
+
+if [[ -n "${VERCEL_GIT_PULL_REQUEST_ID:-}" ]]; then
+  if [[ "${ALLOW_VERCEL_PR_PREVIEW_BUILD:-}" == "1" ]] || [[ "${ALLOW_VERCEL_PR_PREVIEW_BUILD:-}" == "true" ]]; then
+    echo "ALLOW_VERCEL_PR_PREVIEW_BUILD is enabled; continue build."
+    exit 1
+  fi
+
+  echo "Pull request preview detected; skip build."
+  exit 0
+fi
+
 current_sha="${VERCEL_GIT_COMMIT_SHA:-HEAD}"
 previous_sha="${VERCEL_GIT_PREVIOUS_SHA:-}"
 
