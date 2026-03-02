@@ -166,6 +166,46 @@ describe("aiProcessAssistantChat", () => {
     expect(args.tools.forwardEmail).toBeDefined();
   });
 
+  it.each([
+    ["slack", "Slack"],
+    ["teams", "Teams"],
+    ["telegram", "Telegram"],
+  ] as const)("keeps send-email tools for %s messaging chats when enabled", async (messagingPlatform, platformName) => {
+    const { aiProcessAssistantChat } = await loadAssistantChatModule({
+      emailSend: true,
+    });
+
+    mockToolCallAgentStream.mockResolvedValue({
+      toUIMessageStreamResponse: vi.fn(),
+    });
+
+    await aiProcessAssistantChat({
+      messages: baseMessages,
+      emailAccountId: "email-account-id",
+      user: getEmailAccount(),
+      responseSurface: "messaging",
+      messagingPlatform,
+      logger,
+    });
+
+    const args = mockToolCallAgentStream.mock.calls[0][0];
+    expect(args.messages[0].content).toContain(
+      "sendEmail, replyEmail, and forwardEmail prepare a pending action only. No email is sent yet.",
+    );
+    expect(args.messages[0].content).toContain(
+      `In ${platformName}, a Send confirmation button is provided in the thread.`,
+    );
+    expect(args.messages[0].content).toContain(
+      `click the Send button in this ${platformName} thread`,
+    );
+    expect(args.messages[0].content).not.toContain(
+      "Email sending actions are disabled in this environment",
+    );
+    expect(args.tools.sendEmail).toBeDefined();
+    expect(args.tools.replyEmail).toBeDefined();
+    expect(args.tools.forwardEmail).toBeDefined();
+  });
+
   it("omits sendEmail tool when email sending is disabled", async () => {
     const { aiProcessAssistantChat } = await loadAssistantChatModule({
       emailSend: false,
