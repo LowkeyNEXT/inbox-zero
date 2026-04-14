@@ -20,7 +20,8 @@ import {
   type Adapter,
   type Attachment,
   type CardChild,
-  type Message,
+  Message,
+  type ReactionEvent,
   type Thread,
 } from "chat";
 import { env } from "@/env";
@@ -75,6 +76,15 @@ const CONNECT_COMMAND_REGEX =
 const PENDING_EMAIL_CONFIRM_ACTION_ID = "acpe";
 const LEGACY_PENDING_EMAIL_CONFIRM_ACTION_ID =
   "assistant_confirm_pending_email";
+const AFFIRMATIVE_REACTION_EMOJI_TOKENS = new Set(["👍", "✅", "☑", "✔"]);
+const AFFIRMATIVE_REACTION_ALIASES = new Set([
+  "+1",
+  "thumbsup",
+  "thumbs_up",
+  "white_check_mark",
+  "check",
+  "heavy_check_mark",
+]);
 const UNSUPPORTED_MESSAGING_ATTACHMENT_MESSAGE =
   "I can process images, but I can't access other file types (documents, videos, audio) sent here yet. I can still draft the email text if you share what to write.";
 
@@ -91,6 +101,7 @@ const SLACK_ASSISTANT_SUGGESTED_PROMPTS = [
 ];
 
 type SupportedPlatform = MessagingPlatform;
+type MessagingThread = Thread<unknown, unknown>;
 
 type MessagingChatSdkContext = {
   bot: Chat<Record<string, Adapter>>;
@@ -408,6 +419,29 @@ function registerMessagingHandlers({
     });
   });
 
+  bot.onReaction(async (event) => {
+    if (!event.added) return;
+    if (!isAffirmativeReactionEvent(event)) return;
+
+    const provider = getSupportedPlatform(event.thread.adapter.name);
+    if (!provider) return;
+
+    const handlerLogger = getHandlerLogger();
+    const handled = await processMessagingAssistantMessage({
+      adapters,
+      thread: event.thread,
+      message: buildAffirmativeReactionMessage({ event }),
+      logger: handlerLogger,
+    });
+
+    if (handled) {
+      await subscribeMessagingThreadSafely({
+        thread: event.thread,
+        logger: handlerLogger,
+      });
+    }
+  });
+
   bot.onAction(
     [PENDING_EMAIL_CONFIRM_ACTION_ID, LEGACY_PENDING_EMAIL_CONFIRM_ACTION_ID],
     async (event) => {
@@ -454,7 +488,7 @@ async function subscribeMessagingThreadSafely({
   thread,
   logger,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   logger: Logger;
 }) {
   try {
@@ -475,7 +509,7 @@ async function processMessagingAssistantMessage({
   logger,
 }: {
   adapters: MessagingAdapters;
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
   logger: Logger;
 }): Promise<boolean> {
@@ -953,7 +987,7 @@ async function postPendingEmailCard({
   provider,
   logger,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   chatMessageId: string;
   part: PendingEmailToolPart;
   provider: SupportedPlatform;
@@ -1547,7 +1581,7 @@ async function startSlackProcessingReaction({
   logger,
 }: {
   adapters: MessagingAdapters;
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
   logger: Logger;
 }): Promise<(() => Promise<void>) | null> {
@@ -1601,7 +1635,7 @@ async function handleMessagingLinkCommand({
   message,
   logger,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
   logger: Logger;
 }): Promise<boolean> {
@@ -1718,7 +1752,7 @@ async function handleSwitchCommand({
   message,
   logger,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
   logger: Logger;
 }): Promise<boolean> {
@@ -1831,7 +1865,7 @@ async function handleHelpCommand({
   message,
   logger,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
   logger: Logger;
 }): Promise<boolean> {
@@ -1862,7 +1896,7 @@ async function resolveMessagingContext({
   logger,
 }: {
   adapters: MessagingAdapters;
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
   logger: Logger;
 }): Promise<ResolvedMessagingContext | null> {
@@ -1902,7 +1936,7 @@ async function resolveSlackMessagingContext({
   logger,
 }: {
   slackAdapter: SlackAdapter | undefined;
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
   logger: Logger;
 }): Promise<ResolvedMessagingContext | null> {
@@ -1912,17 +1946,17 @@ async function resolveSlackMessagingContext({
   const teamId = rawEvent.team_id ?? rawEvent.team;
   const userId = message.author.userId;
 
-  if (!teamId || !userId) return null;
+  if (!userId) return null;
 
   const { channel, threadTs } = slackAdapter.decodeThreadId(thread.id);
 
-  const candidates = await prisma.messagingChannel.findMany({
+  let candidates = await prisma.messagingChannel.findMany({
     where: {
       provider: MessagingProvider.SLACK,
-      teamId,
       isConnected: true,
       accessToken: { not: null },
       providerUserId: userId,
+      ...(teamId ? { teamId } : {}),
     },
     select: {
       id: true,
@@ -1941,6 +1975,16 @@ async function resolveSlackMessagingContext({
       },
     },
   });
+
+  if (!teamId && !thread.isDM) {
+    candidates = candidates.filter((candidate) =>
+      candidate.routes.some(
+        (route) =>
+          route.targetType === MessagingRouteTargetType.CHANNEL &&
+          route.targetId === channel,
+      ),
+    );
+  }
 
   if (candidates.length === 0) {
     await sendUnauthorizedMessage({ thread, teamId, logger });
@@ -1963,6 +2007,7 @@ async function resolveSlackMessagingContext({
   if (rawEvent.type === "app_mention") {
     messageText = stripLeadingSlackMention(messageText);
   }
+  messageText = normalizeMessagingUserText({ text: messageText });
 
   const hasUnsupportedAttachments = hasUnsupportedMessagingAttachment({
     provider: "slack",
@@ -1996,7 +2041,7 @@ async function resolveLinkedProviderMessagingContext({
   provider: "teams" | "telegram";
   identity: LinkedProviderIdentity | null;
   message: Message;
-  thread: Thread;
+  thread: MessagingThread;
   logger: Logger;
 }): Promise<ResolvedMessagingContext | null> {
   if (!identity) return null;
@@ -2082,10 +2127,12 @@ function resolveTeamsIdentity({
   thread,
   message,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   message: Message;
 }): LinkedProviderIdentity | null {
-  const messageText = expandPromptCommand(message.text.trim());
+  const messageText = normalizeMessagingUserText({
+    text: expandPromptCommand(message.text.trim()),
+  });
   const hasAttachments = message.attachments.length > 0;
   if (!messageText && !hasAttachments) return null;
 
@@ -2138,11 +2185,15 @@ function resolveTelegramIdentity({
 }
 
 function getTelegramMessageText(message: Message): string {
-  const plainText = expandPromptCommand(message.text.trim());
+  const plainText = normalizeMessagingUserText({
+    text: expandPromptCommand(message.text.trim()),
+  });
   if (plainText) return plainText;
 
   const rawMessage = message.raw as TelegramRawMessage;
-  return expandPromptCommand(rawMessage.caption?.trim() || "");
+  return normalizeMessagingUserText({
+    text: expandPromptCommand(rawMessage.caption?.trim() || ""),
+  });
 }
 
 const SUPPORTED_IMAGE_MIME_TYPES = new Set([
@@ -2294,8 +2345,8 @@ async function resolveSlackMessagingChannel({
   chatThreadTs: string | undefined;
   isDirectMessage: boolean;
   logger: Logger;
-  teamId: string;
-  thread: Thread;
+  teamId?: string | null;
+  thread: MessagingThread;
 }): Promise<SlackCandidate | null> {
   if (!isDirectMessage) {
     const channelMatch = candidates.find((candidate) =>
@@ -2370,8 +2421,8 @@ async function sendUnauthorizedMessage({
   teamId,
   logger,
 }: {
-  thread: Thread;
-  teamId: string;
+  thread: MessagingThread;
+  teamId?: string | null;
   logger: Logger;
 }): Promise<void> {
   await postMessagingThreadMessage({
@@ -2383,7 +2434,9 @@ async function sendUnauthorizedMessage({
     logMeta: { teamId },
   });
 
-  logger.info("Unauthorized messaging user attempted bot access", { teamId });
+  logger.info("Unauthorized messaging user attempted bot access", {
+    ...(teamId ? { teamId } : {}),
+  });
 }
 
 async function sendLinkRequiredMessage({
@@ -2392,7 +2445,7 @@ async function sendLinkRequiredMessage({
   logger,
 }: {
   provider: "teams" | "telegram";
-  thread: Thread;
+  thread: MessagingThread;
   logger: Logger;
 }): Promise<void> {
   const providerName = provider === "teams" ? "Teams" : "Telegram";
@@ -2412,7 +2465,7 @@ async function sendDmRequiredMessage({
   logger,
 }: {
   provider: "teams" | "telegram";
-  thread: Thread;
+  thread: MessagingThread;
   logger: Logger;
 }): Promise<void> {
   const providerName = provider === "teams" ? "Teams" : "Telegram";
@@ -2430,7 +2483,7 @@ async function sendUnlinkedChannelMessage({
   thread,
   logger,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   logger: Logger;
 }): Promise<void> {
   await postMessagingThreadMessage({
@@ -2449,7 +2502,7 @@ async function postMessagingThreadMessage({
   errorLogMessage,
   logMeta,
 }: {
-  thread: Thread;
+  thread: MessagingThread;
   logger: Logger;
   message: string;
   errorLogMessage: string;
@@ -2516,6 +2569,39 @@ export function normalizeMessagingAssistantText({ text }: { text: string }) {
   return normalized;
 }
 
+export function buildAffirmativeReactionMessage({
+  event,
+}: {
+  event: ReactionEvent;
+}) {
+  return new Message({
+    id: `reaction:${event.threadId}:${event.messageId}:${event.user.userId}:${event.emoji.name}`,
+    threadId: event.threadId,
+    text: "yes",
+    formatted: {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [{ type: "text", value: "yes" }],
+        },
+      ],
+    },
+    raw: event.raw,
+    author: event.user,
+    metadata: {
+      dateSent: new Date(),
+      edited: false,
+    },
+    attachments: [],
+    links: [],
+  });
+}
+
+export function normalizeMessagingUserText({ text }: { text: string }) {
+  return text.trim();
+}
+
 export function buildPendingEmailCardFallbackText(normalizedText: string) {
   const failureGuidance =
     "I couldn't show the Send button right now. Ask me to prepare the draft again.";
@@ -2529,6 +2615,27 @@ export function buildPendingEmailCardFallbackText(normalizedText: string) {
   }
 
   return `${normalizedText}\n\n${failureGuidance}`;
+}
+
+function isAffirmativeReactionEvent(event: ReactionEvent) {
+  return (
+    isAffirmativeReactionToken(event.rawEmoji) ||
+    isAffirmativeReactionToken(event.emoji.name)
+  );
+}
+
+function isAffirmativeReactionToken(token: string) {
+  const trimmed = token.trim();
+  if (!trimmed) return false;
+
+  const alias = trimmed.toLowerCase();
+  if (AFFIRMATIVE_REACTION_ALIASES.has(alias)) return true;
+
+  const normalized = alias
+    .replaceAll("\uFE0F", "")
+    .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, "");
+
+  return AFFIRMATIVE_REACTION_EMOJI_TOKENS.has(normalized);
 }
 
 function getMessagingAssistantPostPayload({
