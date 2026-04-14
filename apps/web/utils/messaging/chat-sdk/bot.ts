@@ -2175,8 +2175,7 @@ export function hasUnsupportedMessagingAttachment({
     const rawEvent = message.raw as SlackEvent;
     const files = rawEvent.files || [];
     return files.some(
-      (f: { mimetype?: string }) =>
-        !f.mimetype || !f.mimetype.startsWith("image/"),
+      (f: { mimetype?: string }) => !f.mimetype?.startsWith("image/"),
     );
   }
 

@@ -213,7 +213,6 @@ export const POST = withEmailAccount("chat", async (request) => {
   try {
     const inboxStats = await inboxStatsPromise;
     let seenRulesRevision: number | null = null;
-
     const result = await aiProcessAssistantChat({
       messages: modelMessages,
       conversationMessagesForMemory: conversationModelMessages,
@@ -260,7 +259,20 @@ export const POST = withEmailAccount("chat", async (request) => {
         writer.write({ type: "text-end", id: warningPartId });
       },
       onFinish: async ({ messages }) => {
-        await saveChatMessages(messages, chat.id, request.logger);
+        const persistableMessages = messages.filter(
+          isPersistableAssistantMessage,
+        );
+
+        if (persistableMessages.length < messages.length) {
+          request.logger.error("Skipping empty assistant chat messages", {
+            chatId: chat.id,
+            skippedCount: messages.length - persistableMessages.length,
+          });
+        }
+
+        if (persistableMessages.length > 0) {
+          await saveChatMessages(persistableMessages, chat.id, request.logger);
+        }
 
         if (seenRulesRevision != null) {
           await saveLastSeenRulesRevision({
@@ -349,4 +361,22 @@ function buildHiddenInlineActionMessage(
     role: "system" as const,
     parts: [{ type: "text" as const, text }],
   } satisfies UIMessage;
+}
+
+function isPersistableAssistantMessage(message: UIMessage) {
+  if (message.role !== "assistant") return true;
+
+  return hasRenderableAssistantResponse(message);
+}
+
+function hasRenderableAssistantResponse(
+  message: Pick<UIMessage, "parts"> | null | undefined,
+) {
+  const parts = message?.parts;
+  if (!parts?.length) return false;
+
+  return parts.some((part) => {
+    if (part.type !== "text") return true;
+    return part.text.trim().length > 0;
+  });
 }
