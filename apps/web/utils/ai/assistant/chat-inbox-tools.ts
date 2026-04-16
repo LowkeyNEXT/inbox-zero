@@ -25,7 +25,8 @@ import {
 } from "@/utils/senders/unsubscribe";
 import { isMicrosoftProvider } from "@/utils/email/provider-types";
 
-const emptyInputSchema = z.object({});
+const SEARCH_INBOX_MAX_RESULTS = 20;
+
 const recipientListSchema = z
   .string()
   .trim()
@@ -113,7 +114,7 @@ export const getAccountOverviewTool = ({
   tool({
     description:
       "Get account context for inbox operations such as provider details, label availability, meeting-brief settings, and attachment-filing settings.",
-    inputSchema: emptyInputSchema,
+    inputSchema: z.object({}),
     execute: async () => {
       trackToolCall({ tool: "get_account_overview", email, logger });
       try {
@@ -211,8 +212,8 @@ function searchInboxInputSchema(provider: string) {
       .number()
       .int()
       .min(1)
-      .max(50)
-      .default(20)
+      .max(SEARCH_INBOX_MAX_RESULTS)
+      .default(SEARCH_INBOX_MAX_RESULTS)
       .describe("Maximum number of messages to return."),
     pageToken: z
       .string()
@@ -234,7 +235,7 @@ export const searchInboxTool = ({
 }) =>
   tool({
     description:
-      "Search inbox messages and return concise message metadata. If hasMore=true, more matches remain; for bulk or all-matching requests, keep calling searchInbox with nextPageToken until hasMore=false before reporting completion.",
+      "Search inbox messages and return concise message metadata. Limit must be between 1 and 20 messages per call. If hasMore=true, more matches remain; for bulk or all-matching requests, keep calling searchInbox with nextPageToken until hasMore=false before reporting completion.",
     inputSchema: searchInboxInputSchema(provider),
     execute: async ({ query, limit, pageToken }) => {
       trackToolCall({ tool: "search_inbox", email, logger });
@@ -246,24 +247,24 @@ export const searchInboxTool = ({
           logger,
         });
 
-        const { messages, nextPageToken } = await emailProvider.searchMessages({
-          query,
-          maxResults: limit,
-          pageToken: pageToken ?? undefined,
-        });
+        const [searchResult, labels] = await Promise.all([
+          emailProvider.searchMessages({
+            query,
+            maxResults: limit ?? SEARCH_INBOX_MAX_RESULTS,
+            pageToken: pageToken ?? undefined,
+          }),
+          emailProvider.getLabels().catch((error) => {
+            logger.warn("Failed to load labels for search results", { error });
+            return [] as Array<{ id: string; name: string }>;
+          }),
+        ]);
 
-        let labels: Array<{ id: string; name: string }> = [];
-        try {
-          labels = await emailProvider.getLabels();
-        } catch (error) {
-          logger.warn("Failed to load labels for search results", { error });
-        }
-
+        const { messages, nextPageToken } = searchResult;
         const labelsById = createLabelLookupMap(labels);
 
-        const items = messages
-          .slice(0, limit)
-          .map((message) => mapMessageForSearchResult(message, labelsById));
+        const items = messages.map((message) =>
+          mapMessageForSearchResult(message, labelsById),
+        );
 
         return {
           queryUsed: query,
@@ -487,7 +488,7 @@ function manageInboxInputSchema(provider: string) {
     action: z
       .enum(manageInboxActions)
       .describe(
-        "archive_threads: archive by ID (default unless user says delete/trash). trash_threads: move to trash. label_threads: apply a label (requires labelName). mark_read_threads: mark read/unread. bulk_archive_senders: archive ALL emails from senders server-wide (never for trash/delete). unsubscribe_senders: unsubscribe and archive from senders (only for explicit unsubscribe requests).",
+        "archive_threads: archive by ID (default unless user says delete/trash). trash_threads: move to trash. label_threads: apply a label (requires labelName). mark_read_threads: mark read/unread. bulk_archive_senders: archive ALL emails from senders server-wide after the user confirms that broad scope (never for trash/delete). unsubscribe_senders: unsubscribe and archive from senders (only for explicit unsubscribe requests).",
       ),
     threadIds: threadIdsSchema
       .nullish()
@@ -535,7 +536,7 @@ export const manageInboxTool = ({
 
   return tool({
     description:
-      "Run inbox actions on threads or senders. Thread actions accept up to 100 threadIds per call, so bulk requests require repeated manageInbox calls over paginated searchInbox results. For sender-wide cleanup, prefer bulk_archive_senders or unsubscribe_senders with fromEmails.",
+      "Run inbox actions on threads or senders. For emails already shown or found in this turn, prefer thread actions with threadIds. Do not widen a limited thread-level request into sender-wide cleanup. Only use sender-wide cleanup with fromEmails when the user clearly wants all mail from that sender, and get confirmation before doing broad sender-wide cleanup.",
     inputSchema,
     execute: async (input) => {
       trackToolCall({ tool: "manage_inbox", email, logger });
