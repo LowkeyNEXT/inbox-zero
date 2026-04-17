@@ -1,4 +1,5 @@
 import type { CreateOrUpdateRuleSchema } from "@/utils/ai/rule/create-rule-schema";
+import { after } from "next/server";
 import prisma from "@/utils/prisma";
 import type { Logger } from "@/utils/logger";
 import { ActionType } from "@/generated/prisma/enums";
@@ -6,7 +7,12 @@ import type { SystemType } from "@/generated/prisma/enums";
 import type { Prisma, Rule } from "@/generated/prisma/client";
 import { getActionRiskLevel, type RiskAction } from "@/utils/risk";
 import { hasExampleParams } from "@/app/(app)/[emailAccountId]/assistant/examples";
-import { createRuleHistory } from "@/utils/rule/rule-history";
+import {
+  createRuleHistory,
+  getRuleForHistory,
+  ruleHistoryRuleInclude,
+  type RuleHistoryTrigger,
+} from "@/utils/rule/rule-history";
 import { isMicrosoftProvider } from "@/utils/email/provider-types";
 import { createEmailProvider } from "@/utils/email/provider";
 import { resolveLabelNameAndId } from "@/utils/label/resolve-label";
@@ -117,6 +123,28 @@ type RuleRecordData = {
   groupId?: string | null;
 };
 
+async function updateRuleAndQueueHistory({
+  ruleId,
+  emailAccountId,
+  data,
+  triggerType,
+}: {
+  ruleId: string;
+  emailAccountId: string;
+  data: Prisma.RuleUpdateInput;
+  triggerType: RuleHistoryTrigger;
+}) {
+  const rule = await prisma.rule.update({
+    where: { id: ruleId, emailAccountId },
+    data,
+    include: ruleHistoryRuleInclude,
+  });
+
+  queueRuleHistory({ rule, triggerType });
+
+  return rule;
+}
+
 export function partialUpdateRule({
   ruleId,
   emailAccountId,
@@ -126,10 +154,11 @@ export function partialUpdateRule({
   emailAccountId: string;
   data: Partial<Rule>;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data,
-    include: { actions: true, group: true },
+    triggerType: "conditions_updated",
   });
 }
 
@@ -142,9 +171,11 @@ export function updateRuleInstructions({
   emailAccountId: string;
   instructions: string;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data: { instructions },
+    triggerType: "instructions_updated",
   });
 }
 
@@ -157,9 +188,11 @@ export function setRuleRunOnThreads({
   emailAccountId: string;
   runOnThreads: boolean;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data: { runOnThreads },
+    triggerType: "run_on_threads_updated",
   });
 }
 
@@ -172,10 +205,11 @@ export function setRuleEnabled({
   emailAccountId: string;
   enabled: boolean;
 }) {
-  return prisma.rule.update({
-    where: { id: ruleId, emailAccountId },
+  return updateRuleAndQueueHistory({
+    ruleId,
+    emailAccountId,
     data: { enabled },
-    include: { actions: true },
+    triggerType: "enabled_updated",
   });
 }
 
@@ -222,7 +256,7 @@ export async function createRuleWithResolvedActions({
     include: { actions: true, group: true },
   });
 
-  return rule as RuleWithRelations;
+  return rule;
 }
 
 export async function replaceRuleWithResolvedActions({
@@ -282,7 +316,7 @@ export async function replaceRuleWithResolvedActions({
     });
   }
 
-  return rule as RuleWithRelations;
+  return rule;
 }
 
 export async function createRule({
@@ -349,7 +383,7 @@ export async function createRule({
       actions: mappedActions,
     });
 
-    await createRuleHistory({ rule, triggerType: "created" });
+    queueRuleHistory({ rule, triggerType: "created" });
 
     return rule;
   } catch (error) {
@@ -408,7 +442,7 @@ export async function updateRule({
       actions: mappedActions,
     });
 
-    await createRuleHistory({ rule, triggerType: "updated" });
+    queueRuleHistory({ rule, triggerType: "updated" });
 
     return rule;
   } catch (error) {
@@ -469,7 +503,7 @@ export async function upsertSystemRule({
       actions,
     });
 
-    await createRuleHistory({ rule, triggerType: "updated" });
+    queueRuleHistory({ rule, triggerType: "updated" });
     return rule;
   } else {
     logger.info("Creating new system rule");
@@ -483,7 +517,7 @@ export async function upsertSystemRule({
         actions,
       });
 
-      await createRuleHistory({ rule, triggerType: "created" });
+      queueRuleHistory({ rule, triggerType: "created" });
       return rule;
     } catch (error) {
       if (!isDuplicateError(error, "name")) throw error;
@@ -503,7 +537,7 @@ export async function upsertSystemRule({
         actions,
       });
 
-      await createRuleHistory({ rule, triggerType: "updated" });
+      queueRuleHistory({ rule, triggerType: "updated" });
       return rule;
     }
   }
@@ -546,7 +580,7 @@ export async function updateRuleActions({
   );
   validateWebhookUrlsInActions(mappedActions);
 
-  return prisma.rule.update({
+  const rule = await prisma.rule.update({
     where: { id: ruleId, emailAccountId },
     data: {
       actions: {
@@ -556,7 +590,12 @@ export async function updateRuleActions({
         },
       },
     },
+    include: ruleHistoryRuleInclude,
   });
+
+  queueRuleHistory({ rule, triggerType: "actions_updated" });
+
+  return rule;
 }
 
 export async function deleteRule({
@@ -568,6 +607,19 @@ export async function deleteRule({
   ruleId: string;
   groupId?: string | null;
 }) {
+  const rule = await getRuleForHistory({ ruleId, emailAccountId });
+  if (!rule) {
+    await prisma.rule.delete({ where: { id: ruleId, emailAccountId } });
+    return;
+  }
+
+  // RuleHistory still references Rule, so deletes must snapshot before
+  // removing the rule row.
+  await createRuleHistory({
+    rule,
+    triggerType: "deleted",
+  });
+
   if (groupId) {
     const deletedGroups = await prisma.group.deleteMany({
       where: { id: groupId, emailAccountId },
@@ -789,6 +841,13 @@ function validateWebhookUrlsInActions(actions: RuleActionCreateData[]) {
       throw new SafeError(`Invalid webhook URL: ${result.error}`, 400);
     }
   }
+}
+
+function queueRuleHistory(params: {
+  rule: RuleWithRelations;
+  triggerType: RuleHistoryTrigger;
+}) {
+  after(() => createRuleHistory(params));
 }
 
 function addNestedActionOwnershipToInputs(
